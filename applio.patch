@@ -1,0 +1,122 @@
+diff --git a/rvc/lib/algorithm/commons.py b/rvc/lib/algorithm/commons.py
+index 47375eaf..77c91049 100644
+--- a/rvc/lib/algorithm/commons.py
++++ b/rvc/lib/algorithm/commons.py
+@@ -36,6 +36,13 @@ def convert_pad_shape(pad_shape):
+     """
+     l = pad_shape[::-1]
+     pad_shape = [item for sublist in l for item in sublist]
++    # Strip trailing (0, 0) pairs. Torch pads dims from last to first, so pairs
++    # at the tail pad outer dims with zero -- a no-op. Keeping them forces the
++    # pad op into an N>3 dim path that on MPS goes through a slow/buggy fallback
++    # (constant_pad_nd with >6 pad values crashes the backward with a 0-size
++    # MTLBuffer assertion). Shrinking the spec keeps us on the native MPS path.
++    while len(pad_shape) >= 2 and pad_shape[-1] == 0 and pad_shape[-2] == 0:
++        pad_shape = pad_shape[:-2]
+     return pad_shape
+ 
+ 
+@@ -56,13 +63,21 @@ def slice_segments(
+     elif dim == 3:
+         ret = torch.zeros_like(x[:, :, :segment_size])
+ 
++    seq_len = x.size(-1)
+     for i in range(x.size(0)):
+-        idx_str = ids_str[i].item()
+-        idx_end = idx_str + segment_size
++        idx_str = int(ids_str[i].item())
++        # Clamp to valid range; if the requested slice overruns the wave (which
++        # can happen when ids_slice was computed from spec frames but wave was
++        # padded differently), leave the tail as the zero fill.
++        idx_str = max(0, min(idx_str, seq_len))
++        idx_end = min(idx_str + segment_size, seq_len)
++        take = idx_end - idx_str
++        if take <= 0:
++            continue
+         if dim == 2:
+-            ret[i] = x[i, idx_str:idx_end]
++            ret[i, :take] = x[i, idx_str:idx_end]
+         else:
+-            ret[i] = x[i, :, idx_str:idx_end]
++            ret[i, :, :take] = x[i, :, idx_str:idx_end]
+ 
+     return ret
+ 
+diff --git a/rvc/lib/algorithm/generators/hifigan_nsf.py b/rvc/lib/algorithm/generators/hifigan_nsf.py
+index 20928af2..9aef48a6 100644
+--- a/rvc/lib/algorithm/generators/hifigan_nsf.py
++++ b/rvc/lib/algorithm/generators/hifigan_nsf.py
+@@ -44,8 +44,27 @@ class SourceModuleHnNSF(torch.nn.Module):
+         )
+         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
+         self.l_tanh = torch.nn.Tanh()
++        # Workaround for MPS backward zero-buffer crash: run this tiny module on CPU.
++        # The l_linear backward on MPS trips Apple's MPSCommandBufferImageCache 0-byte
++        # allocation assertion. The transfer is cheap (~50KB, unified memory on Apple Silicon).
++        self._force_cpu = False
++
++    def _apply(self, fn, *args, **kwargs):
++        # Override _apply so model.to('mps') doesn't move this submodule to MPS.
++        if self._force_cpu:
++            return self
++        return super()._apply(fn, *args, **kwargs)
+ 
+     def forward(self, x: torch.Tensor, upsample_factor: int = 1):
++        orig_device = x.device
++        if self._force_cpu and orig_device.type != "cpu":
++            x_cpu = x.detach().cpu()
++            if x.requires_grad:
++                x_cpu.requires_grad_(True)
++            sine_wavs, uv, _ = self.l_sin_gen(x_cpu, upsample_factor)
++            sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
++            sine_merge = self.l_tanh(self.l_linear(sine_wavs))
++            return sine_merge.to(orig_device), None, None
+         sine_wavs, uv, _ = self.l_sin_gen(x, upsample_factor)
+         sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
+         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+diff --git a/rvc/train/train.py b/rvc/train/train.py
+index 6d305cbb..9bfb041c 100644
+--- a/rvc/train/train.py
++++ b/rvc/train/train.py
+@@ -339,12 +339,13 @@ def run(
+     else:
+         writer_eval = None
+ 
+-    dist.init_process_group(
+-        backend="gloo" if sys.platform == "win32" or device.type != "cuda" else "nccl",
+-        init_method="env://",
+-        world_size=n_gpus if device.type == "cuda" else 1,
+-        rank=rank if device.type == "cuda" else 0,
+-    )
++    if device.type == "cuda":
++        dist.init_process_group(
++            backend="gloo" if sys.platform == "win32" else "nccl",
++            init_method="env://",
++            world_size=n_gpus,
++            rank=rank,
++        )
+ 
+     torch.manual_seed(config.train.seed)
+ 
+@@ -444,6 +445,21 @@ def run(
+     else:
+         net_g = net_g.to(device)
+         net_d = net_d.to(device)
++        # MPS workaround: keep SourceModuleHnNSF on CPU to dodge the backward
++        # zero-buffer crash in its Linear layer.
++        if device.type == "mps":
++            _g = net_g.module if hasattr(net_g, "module") else net_g
++            if hasattr(_g, "dec") and hasattr(_g.dec, "m_source"):
++                # MPS workaround: move m_source to CPU AND freeze its parameters.
++                # Freezing eliminates the cross-device backward through `.to()` that was
++                # tripping an MPS command-buffer scheduling assertion. m_source's two
++                # scalar params (Linear(1,1) weight+bias) are pretrained to reasonable
++                # values; keeping them fixed is a very minor functional trade-off.
++                _g.dec.m_source.cpu()
++                _g.dec.m_source._force_cpu = True
++                for _p in _g.dec.m_source.parameters():
++                    _p.requires_grad = False
++                print("MPS workaround: m_source pinned to CPU and frozen.", flush=True)
+ 
+     if bf16_adamw == True and train_dtype == torch.bfloat16:
+         print("Using BFload16 AdamW optimizer")

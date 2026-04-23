@@ -1,0 +1,45 @@
+diff --git a/aten/src/ATen/mps/MPSAllocator.mm b/aten/src/ATen/mps/MPSAllocator.mm
+index dfdd67c..51db679 100644
+--- a/aten/src/ATen/mps/MPSAllocator.mm
++++ b/aten/src/ATen/mps/MPSAllocator.mm
+@@ -736,7 +736,12 @@ DeleterFnPtr raw_deleter() const override {
+   }
+ 
+   DataPtr allocate(const size_t nbytes) override {
+-    __block id<MTLBuffer> buf = nbytes > 0 ? _getAllocImpl().malloc(nbytes, m_usage) : nullptr;
++    // Always allocate at least 1 byte. Apple's MPS internals (e.g.
++    // MPSCommandBufferImageCache) assert on zero-length Metal buffers when a
++    // nullptr-backed tensor is bound as a graph placeholder, and many MPS ops
++    // pre-allocate outputs as at::empty({0}, ...) expecting to resize later.
++    // The extra byte is wasted but guarantees a valid id<MTLBuffer>.
++    __block id<MTLBuffer> buf = _getAllocImpl().malloc(nbytes > 0 ? nbytes : 1, m_usage);
+     return {buf, buf, &Delete, at::Device(at::DeviceType::MPS, 0)};
+   }
+ 
+diff --git a/aten/src/ATen/native/mps/operations/FastFourierTransform.mm b/aten/src/ATen/native/mps/operations/FastFourierTransform.mm
+index 9f50a23..77d81a6 100644
+--- a/aten/src/ATen/native/mps/operations/FastFourierTransform.mm
++++ b/aten/src/ATen/native/mps/operations/FastFourierTransform.mm
+@@ -39,12 +39,20 @@ MPSGraphFFTScalingMode normalization_to_ScalingMode(int64_t normalization) {
+ } // anonymous namespace
+ 
+ Tensor _fft_c2r_mps(const Tensor& self, IntArrayRef dim, int64_t normalization, int64_t last_dim_size) {
+-  auto out = at::empty({}, self.options().dtype(c10::toRealValueType(self.scalar_type())));
++  const auto in_sizes = self.sym_sizes();
++  SymDimVector out_sizes(in_sizes.begin(), in_sizes.end());
++  out_sizes[dim.back()] = last_dim_size;
++  auto out = at::empty_symint(out_sizes, self.options().dtype(c10::toRealValueType(self.scalar_type())));
+   return _fft_c2r_mps_out(self, dim, normalization, last_dim_size, out);
+ }
+ 
+ Tensor _fft_r2c_mps(const Tensor& self, IntArrayRef dim, int64_t normalization, bool onesided) {
+-  auto out = at::empty({}, self.options().dtype(c10::toComplexType(self.scalar_type())));
++  const auto in_sizes = self.sym_sizes();
++  SymDimVector out_sizes(in_sizes.begin(), in_sizes.end());
++  if (onesided) {
++    out_sizes[dim.back()] = in_sizes[dim.back()] / 2 + 1;
++  }
++  auto out = at::empty_symint(out_sizes, self.options().dtype(c10::toComplexType(self.scalar_type())));
+   return _fft_r2c_mps_out(self, dim, normalization, onesided, out);
+ }
+ 
